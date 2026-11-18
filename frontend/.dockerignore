@@ -1,0 +1,10 @@
+.git
+.env*
+ecommerce-local.env
+node_modules
+.next
+coverage
+*.log
+*.pdf
+README.md
+Dockerfile*

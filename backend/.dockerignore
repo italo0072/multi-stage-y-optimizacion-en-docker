@@ -1,0 +1,12 @@
+.git
+.env*
+ecommerce-local.env
+vendor
+node_modules
+tests
+bootstrap/cache/*.php
+storage/logs/*
+storage/api-docs
+*.pdf
+README.md
+Dockerfile*

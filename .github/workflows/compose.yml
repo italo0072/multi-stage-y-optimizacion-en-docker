@@ -1,0 +1,102 @@
+name: Validar Docker Compose
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Escribir las cuatro credenciales desde PowerShell
+        shell: pwsh
+        run: |
+          Copy-Item .env.example .env
+          $origen = 'NUEVA'
+          $usuario = "$(id -u):$(id -g)"
+          docker pull node:24-alpine
+          foreach ($nombre in 'APP_KEY','JWT_SECRET','MYSQL_PASSWORD','MYSQL_ROOT_PASSWORD') {
+            $origen | docker run --rm -i --user $usuario -v "${PWD}:/proyecto" -w /proyecto node:24-alpine node herramientas/clave.mjs $nombre
+            if ($LASTEXITCODE -ne 0) { throw "No se guardó $nombre" }
+          }
+
+      - name: Validar la configuración de Compose
+        run: docker compose config --quiet
+
+      - name: Construir y levantar los servicios
+        run: docker compose up -d --build --wait --wait-timeout 180
+
+      - name: Verificar API, Swagger, catálogo y persistencia
+        run: |
+          docker compose exec -T backend php artisan db:seed --class=ProductSeeder --force
+          curl -fsS http://localhost:8000/up
+          curl -fsS http://localhost:8000/api/documentation
+          curl -fsS http://localhost:8000/docs | jq -e '.paths["/products"].get != null and .servers[0].url == "/api"'
+          curl -fsS http://localhost:8000/api/products | jq -e '.. | objects | select(.sku? == "KB-RGB-001")'
+          curl -fsS --retry 10 --retry-connrefused --retry-delay 2 http://localhost:3000/ > /tmp/catalogo.html
+          grep -q 'Teclado mecanico RGB' /tmp/catalogo.html
+
+          api=http://localhost:8000/api
+          token=$(curl -fsS "$api/auth/register" -H 'Content-Type: application/json' \
+            -d '{"name":"Cliente CI","email":"cliente@example.com","password":"Temporal12345","password_confirmation":"Temporal12345"}' | jq -er '.data.access_token')
+          product_id=$(curl -fsS "$api/products" | jq -er '.data[] | select(.sku == "KB-RGB-001") | .id')
+          items=$(jq -nc --argjson id "$product_id" '{items:[{product_id:$id,quantity:1}]}')
+          order_id=$(curl -fsS "$api/orders" -H "Authorization: Bearer $token" \
+            -H 'Content-Type: application/json' -d "$items" | jq -er '.data | select(.status == "pending") | .id')
+
+          payment=$(jq -nc --argjson id "$order_id" '{order_id:$id,payment_method:"pm_card_visa"}')
+          status=$(curl -sS -o /tmp/stripe.json -w '%{http_code}' "$api/payments/create-intent" \
+            -H "Authorization: Bearer $token" -H 'Content-Type: application/json' -d "$payment")
+          test "$status" = "503"
+
+          docker compose down
+          docker compose up -d --wait --wait-timeout 180
+          curl -fsS "$api/orders/$order_id" -H "Authorization: Bearer $token" \
+            | jq -e --argjson id "$order_id" '.data | .id == $id and .status == "pending"'
+          curl -fsS http://localhost:8000/api/products | jq -e '.. | objects | select(.sku? == "KB-RGB-001")'
+
+      - name: Verificar imágenes, importación por SKU y conservación del stock
+        run: |
+          api=http://localhost:8000/api
+          id=$(curl -fsS "$api/products" | jq -er '.data[] | select(.sku == "KB-RGB-001") | .id')
+          previous=$(curl -fsS "$api/products/$id" | jq -cS '.data | del(.image_url)')
+          curl -fsS http://localhost:3000/imagenes/productos/KB-RGB-001.webp -o /tmp/foto.webp
+          test "$(file -b --mime-type /tmp/foto.webp)" = 'image/webp'
+
+          long_url=$(python3 -c "print('https://catalogo.example.org/combo.webp?ref=' + 'a' * 320)")
+          cat > /tmp/productos.csv <<CSV
+          sku,name,description,price,stock,image_url,is_active
+          KB-RGB-001,Nombre de origen,Prueba,1.00,1,https://catalogo.example.org/teclado.webp,1
+          923M-PW23-02,Combo CI,Teclado y mouse,30.00,11,$long_url,1
+          CSV
+          docker compose cp /tmp/productos.csv backend:/tmp/productos.csv
+          docker compose exec -T backend php artisan productos:importar-imagenes /tmp/productos.csv
+          docker compose exec -T backend php artisan db:seed --class=ProductSeeder --force
+          after=$(curl -fsS "$api/products/$id")
+          test "$previous" = "$(jq -cS '.data | del(.image_url)' <<< "$after")"
+          jq -e '.data.image_url == "https://catalogo.example.org/teclado.webp"' <<< "$after"
+          curl -fsS "$api/products" | jq -e --arg image "$long_url" '.data[] | select(.sku == "923M-PW23-02" and .stock == 11 and .image_url == $image)'
+          curl -fsS http://localhost:3000/ -o /tmp/catalogo-importado.html
+          grep -Fq 'src="https://catalogo.example.org/teclado.webp"' /tmp/catalogo-importado.html
+          curl -fsS "http://localhost:3000/products/$id" -o /tmp/ficha.html
+          grep -Fq 'src="https://catalogo.example.org/teclado.webp"' /tmp/ficha.html
+
+          sed -e 's|teclado.webp|intento.webp|' -e 's|https://catalogo.example.org/combo.webp[^,]*|https://catalogo.example.org/incompleta...|' /tmp/productos.csv > /tmp/invalido.csv
+          docker compose cp /tmp/invalido.csv backend:/tmp/invalido.csv
+          if docker compose exec -T backend php artisan productos:importar-imagenes /tmp/invalido.csv; then exit 1; fi
+          curl -fsS "$api/products/$id" | jq -e '.data.image_url == "https://catalogo.example.org/teclado.webp"'
+
+      - name: Mostrar estado e imágenes
+        if: always()
+        run: |
+          docker compose ps
+          docker compose images
+
+      - name: Eliminar entorno temporal
+        if: always()
+        run: docker compose down -v --remove-orphans
